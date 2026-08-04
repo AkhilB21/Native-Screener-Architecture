@@ -50,3 +50,146 @@ Pandas is strictly single-threaded and heavily penalizes looping. You need an en
 * **DuckDB:** If you prefer SQL, DuckDB is an in-process analytical database that can read your Parquet files directly. DuckDB features a state-of-the-art windowing engine optimized specifically for calculating moving aggregates (like moving averages and running totals) in parallel.
 
 If your goal is pure backtesting speed, migrating your engine to **VectorBT** will give you the most dramatic performance leap.
+
+
+Claude Response on data query:
+
+Also pulling the architecture doc for full context:Full picture read: `Data Query for Apollo.md` + `NATIVE_SCREENER_ARCHITECTURE.md`. Here's the full critique.
+
+---
+
+## Document Assessment
+
+The document is AI-generated advisory content (Q&A format). The information is technically accurate at the concept level but architecturally misaligned with your actual workload. It answers the generic question correctly while answering *your* question poorly.
+
+---
+
+## Where the Document is Wrong or Misleading
+
+### 1. TSDB Recommendation is Architectural Overkill
+
+- QuestDB and ClickHouse are **server processes** requiring separate deployment and ops overhead.
+- Your workload: **2,400 stocks × 3yr daily OHLCV = ~1.8M rows**. This fits in 200MB RAM.
+- TSDBs are built for millions of **ticks per second** ingestion. You're doing **batch reads once per scan cycle**.
+- Recommending QuestDB here is like installing PostgreSQL to store a config file.
+
+### 2. ArcticDB is Wrong for This Context
+
+- Bitemporal versioning ("Git for DataFrames") adds C++ dependency complexity.
+- The use case it solves: regulatory point-in-time queries in production trading systems.
+- Your use case: single-user local screener on daily OHLCV data.
+- No benefit. Real cost: additional maintenance surface.
+
+### 3. The Bottleneck Diagnosis is Incomplete
+
+The document identifies:
+- ✅ File I/O from 1,600 separate file opens — correct
+- ✅ Pandas single-threading — correct
+- ❌ Missing: **indicator library** is likely the dominant compute bottleneck
+
+If you're using `pandas_ta` (pure Python) for 30 conditions across 1,600 stocks, switching to `ta-lib` (C-compiled) alone can yield 5–10x speedup with **zero storage or architecture changes**.
+
+### 4. "Under 5 seconds" Claim Needs a Caveat
+
+- True for daily data with vectorized ops.
+- Your 4H + Weekly multi-timeframe data multiplies row count by 6x.
+- Realistic target for your full universe + 3 TFs + 30 conditions: **15–60 seconds in Polars**, not 5.
+
+---
+
+## What I Would Actually Recommend
+
+### Context from Your Architecture Doc
+
+Apollo already has `apollo_data/*.parquet` for 2,400 stocks at D/4H/W. The storage question is mostly solved. The real question is: **how are those files structured, and how is your screener reading them?**
+
+---
+
+### Tier 1 — Zero Architectural Change, 3–5x Speedup
+
+**Apply immediately, no framework swap required:**
+
+- **Merge per-stock files** into a single `all_stocks_daily.parquet`, `all_stocks_4h.parquet`, `all_stocks_weekly.parquet` with `symbol` as a column, sorted by `(symbol, date)`. Eliminates 2,400 file-open round trips.
+- **Switch `memory_map=True`** in `pyarrow.parquet.read_table()`. Zero-copy reads into pandas-compatible Arrow buffers.
+- **Switch from `pandas_ta` → `ta-lib`** for indicator computation. Drop-in for most indicators; C-compiled, 5–10x faster per indicator call.
+- **Add `engine='pyarrow'`** to your `pd.read_parquet()` calls if not already set.
+
+### Tier 2 — Polars, 10–20x Speedup, Moderate Rewrite
+
+**Correct tool for your specific problem:**
+
+- Written in Rust. Lazy evaluation. Automatic multi-threading across all CPU cores.
+- Rolling window operations (`rolling_mean`, `rolling_std`) are parallelized natively.
+- Pattern:
+
+```python
+import polars as pl
+
+df = (
+    pl.scan_parquet("apollo_data/all_stocks_daily.parquet")
+    .with_columns([
+        pl.col("close").rolling_mean(21).over("symbol").alias("sma21"),
+        pl.col("close").rolling_mean(50).over("symbol").alias("sma50"),
+        # ... 28 more conditions
+    ])
+    .filter(pl.col("date") == pl.col("date").max())  # latest bar only
+    .collect()
+)
+```
+
+- No server. No dependency hell. Reads your existing Parquet files directly.
+
+### Tier 3 — DuckDB, For Complex Multi-Condition Queries
+
+**If you prefer SQL and want ad-hoc flexibility:**
+
+```sql
+SELECT symbol, date,
+    AVG(close) OVER (
+        PARTITION BY symbol ORDER BY date
+        ROWS BETWEEN 20 PRECEDING AND CURRENT ROW
+    ) AS ma21,
+    -- 29 more window functions
+FROM read_parquet('apollo_data/all_stocks_daily.parquet')
+WHERE date = (SELECT MAX(date) FROM read_parquet('apollo_data/all_stocks_daily.parquet'))
+```
+
+- In-process. No server. Reads Parquet natively. Parallel execution across cores.
+- Best fit if you want to express your 30 conditions as SQL window functions.
+
+### Do NOT Use
+
+| Tool | Reason to Skip |
+|---|---|
+| QuestDB / ClickHouse | Server processes. Wrong ingestion model for batch daily backtest reads. |
+| ArcticDB | Dependency complexity with no payoff for single-user local tool. |
+| Arrow/Feather | Only wins over Parquet when you load the full dataset repeatedly. DuckDB/Polars make this irrelevant. |
+
+---
+
+## On Your Architecture Document (NATIVE_SCREENER_ARCHITECTURE.md)
+
+The architecture design itself is **well-constructed**. Specific observations:
+
+**Strengths:**
+- Emergent phase classification via normalized features (percentile ranks, z-scores) over per-bucket hardcoded thresholds — this is the correct call. Per-bucket scoring is a known overfitting vector in systematic trading systems.
+- Empirical discovery (Phase A) before building momentum weights — most retail quant tools skip this entirely and curve-fit from day one.
+- Two-layer architecture (normalized features + regime overlays) — overlays are coarse-grained enough to avoid parameter explosion.
+
+**Issues to fix:**
+
+- **Section 9 path mismatch** (`nse_output/` vs `chartink_output/`) — put the output directory in a single `config.py` constant. Remove hardcoded strings from both `dashboard.py` and `watchlist_generator.py`. This is a maintenance debt that will surface again as a silent bug post-migration.
+
+- **Recovery score component "% fall from high (more fall = more recovery room)"** — this is a value-trap pattern. In trending markets, more drawdown correlates with higher probability of continued decline, not recovery. Weight this signal carefully. Consider using it as a *gate* (exclude stocks with >60% drawdown) rather than a *reward* component.
+
+- **Momentum scoring Phase A** — when you run the historical analysis, ensure your "success" definition accounts for market-regime conditioning (NIFTY 50 trend state at the time). Features that predict momentum in bull regimes often invert in bear regimes. If you pool all market conditions, the feature profiles will be noisy.
+
+---
+
+## Recommended Action Sequence
+
+1. Merge your `apollo_data/` per-stock Parquet files into consolidated multi-symbol files (one per timeframe).
+2. Profile your current 15-min runtime: split into I/O time vs compute time (`time.perf_counter()` around file reads vs indicator computation separately).
+3. If compute > I/O: swap indicator library to `ta-lib` first, measure again.
+4. If I/O > compute after merge: try Polars `scan_parquet` with lazy evaluation.
+5. Fix the `nse_output/` vs `chartink_output/` path issue before migrating away from Chartink — you'll hit it on first run of the native screener.

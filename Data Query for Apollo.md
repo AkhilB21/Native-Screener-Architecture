@@ -193,3 +193,36 @@ The architecture design itself is **well-constructed**. Specific observations:
 3. If compute > I/O: swap indicator library to `ta-lib` first, measure again.
 4. If I/O > compute after merge: try Polars `scan_parquet` with lazy evaluation.
 5. Fix the `nse_output/` vs `chartink_output/` path issue before migrating away from Chartink — you'll hit it on first run of the native screener.
+
+DeepSeek's Response:
+Read it fully, in the context of what I know about your actual engine. Here's my answer to the architectural question.
+Direct answer to the question
+
+Parquet is the right canonical format for Apollo — don't change storage. Your dataset is ~1,679 symbols × D/4H/W × 3 years ≈ 1.8M daily rows, which fits in ~200 MB RAM. You do batch reads, not high-frequency ingestion. Every "alternative" in the original Q&A (QuestDB, ClickHouse, ArcticDB) solves a problem you don't have — streaming millions of ticks/sec or regulatory point-in-time queries. The format is not your bottleneck.
+Where the doc is wrong about your workload
+
+    "15 minutes is extremely slow, should be under 5 seconds" is apples-to-oranges. A "load + compute 30 rolling means" screener should be near-instant. But Apollo's 15-minute run is a full backtest — indicators, Renko brick building, 21+ signal evaluations, trade simulation, drawdown tracking, per stock. That's a fundamentally heavier workload. ~0.5s per stock for a complete backtest with trade simulation is not egregious; it's a target for optimization, not evidence of a storage failure.
+
+    The "swap to ta-lib" advice is mostly moot for Apollo. You don't use pandas_ta — you have your own apollo_core/indicators.py (compute_rsi, compute_stochastic, compute_vpt, compute_adx, plus custom TP28/WC50/WC21). ta-lib only helps the standard subset (RSI/SMA/EMA/Stoch) and can't do your custom indicators. It's a maybe-after-profiling, not a first move.
+
+    Claude's "filter to latest bar" Polars example hides the real requirement. Your normalized features are rolling percentiles vs each stock's own history — you need full per-stock history to compute them, and the cross-sectional layer needs per-date grouping across symbols (which .over("symbol") doesn't give). It's not "read latest bar," it's "compute rolling windows over symbol, then group_by date." The pattern is doable but subtler than shown.
+
+What I'd actually recommend (profiling-first)
+
+Step 0 — Profile before changing anything. Split the 15 minutes: time.perf_counter() around (a) file I/O, (b) indicator computation, (c) the per-bar backtest loop. The doc guesses I/O + pandas; I suspect the real cost is (c) — the per-bar Python loop in trade_engine.py, which neither Parquet merges nor Polars will fix. Ten minutes of profiling tells you where the money is, and everything downstream depends on that answer.
+
+Step 1 — No-architecture-change wins (do all of these):
+
+    Stop recomputing indicators every run. This is the single biggest win, and it's already the native screener plan: cache feature frames as apollo_data/features/<SYMBOL>.parquet during sync, recompute only the 60-bar tail. The screener then never recomputes RSI/stoch/ATR/percentiles — it reads.
+    Consolidate a screen-table only for the screener path. Keep apollo_data/daily/<SYMBOL>.parquet as the canonical store (sync/gating/tombstone stay simple), and derive a cached all_stocks_daily.parquet (symbol, date, close/high/low/volume) for cross-sectional scans. One file, one read, then group_by(date) for cross-sectional ranks. This fixes the 1,600-file-open cost without restructuring the canonical store.
+    Use pyarrow read with columns-pruning (read only OHLCV you need, skip Series/TOTAL_TRADES) — trivial, already partially in data_repo/repo.py.
+
+Step 2 — Only if profiling points there:
+
+    Vectorize the hot loop, not the storage. Precompute all signal columns vectorized (they already are, mostly), and isolate the genuinely sequential part of the backtest (trade state machine) to a tight loop. This is higher ROI than a Polars rewrite because your indicators are already pandas-vectorized; the rewrite risk isn't worth it for the core engine.
+    Polars as an optional screener-side reader (lazy scan_parquet, .over("symbol") rolling) is reasonable if the screen-table profiling shows pandas overhead dominating. Not a mandate.
+    DuckDB is genuinely optional and I'd skip it — you express scoring in Python, not SQL, and the screen-table + pandas/Polars covers it.
+
+What I'd do: Profile → then Step 1 (feature caching + screen-table consolidation) → re-measure. I expect that alone takes the screener path from minutes to seconds and meaningfully cuts the backtest by removing indicator recomputation. Keep Parquet, keep the per-stock canonical store, keep your indicator library, and only touch Polars/DuckDB if the profile demands it.
+
+One caveat worth repeating from earlier: on-disk you have 1,679 parquets, not the 2,438 in the combined-universe JSON — that sync-gating gap should be resolved before we benchmark anything on "2,400 stocks."
